@@ -328,6 +328,208 @@ class AuditEvent(TimestampMixin, Base):
     after: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
 
+# --- ABK Web App -----------------------------------------------------------------------------
+# ABK (field crew) submit daily reports from the ABK Web App without logging in: every request
+# carries the ABK username and PIN. ABK are employees, never ``users``: they get no JWT and cannot
+# reach any other endpoint, and finance-service never sees them. A report stays a DRAFT, outside
+# every inventory, population and biomass figure, until an Admin/Superadmin approves it; approval
+# creates the real ``daily_records`` row through the normal daily-record rules.
+
+
+class AbkAccount(TimestampMixin, Base):
+    """PIN credential of one employee working as ABK."""
+
+    __tablename__ = "abk_accounts"
+    __table_args__ = (
+        CheckConstraint("username = lower(username)", name="username_lowercase"),
+        CheckConstraint("failed_pin_attempts >= 0", name="failed_pin_attempts"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"), unique=True)
+    username: Mapped[str] = mapped_column(String(60), unique=True)
+    pin_hash: Mapped[str] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Consecutive wrong PINs; reaching the limit locks the account until locked_until.
+    failed_pin_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pin_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_authenticated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # What the ABK may report on: chicken (Ayam, including egg sales) and/or fish (Lele). An account
+    # may have no scope at all: its PIN still works but it can submit nothing.
+    scope_ayam: Mapped[bool] = mapped_column(Boolean, default=False)
+    scope_lele: Mapped[bool] = mapped_column(Boolean, default=False)
+    employee: Mapped[Employee] = relationship()
+
+    @property
+    def scopes(self) -> list[str]:
+        return [species for species, allowed in (("AYAM", self.scope_ayam), ("LELE", self.scope_lele)) if allowed]
+
+
+class AbkDailyReport(TimestampMixin, Base):
+    """Daily record submitted by an ABK, waiting for (or after) Admin/Superadmin review."""
+
+    __tablename__ = "abk_daily_reports"
+    __table_args__ = (
+        CheckConstraint("status IN ('DRAFT','APPROVED','REJECTED')", name="status"),
+        CheckConstraint("mortality >= 0", name="mortality"),
+        CheckConstraint(
+            "(status = 'DRAFT' AND reviewed_by IS NULL AND reviewed_at IS NULL"
+            " AND rejection_reason IS NULL AND daily_record_id IS NULL)"
+            " OR (status = 'APPROVED' AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL"
+            " AND rejection_reason IS NULL AND daily_record_id IS NOT NULL)"
+            " OR (status = 'REJECTED' AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL"
+            " AND rejection_reason IS NOT NULL AND daily_record_id IS NULL)",
+            name="review",
+        ),
+        # At most one report per group and date waits for review; rejected ones can be resubmitted.
+        Index(
+            "uq_abk_daily_reports_pending",
+            "group_id",
+            "record_date",
+            unique=True,
+            postgresql_where=text("status = 'DRAFT'"),
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"), index=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("livestock_groups.id", ondelete="RESTRICT"), index=True)
+    record_date: Mapped[date] = mapped_column(Date, index=True)
+    mortality: Mapped[int] = mapped_column(BigInteger, default=0)
+    notes: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(10), default="DRAFT", index=True)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rejection_reason: Mapped[str | None] = mapped_column(Text)
+    # The daily record created on approval.
+    daily_record_id: Mapped[int | None] = mapped_column(
+        ForeignKey("daily_records.id", ondelete="RESTRICT"), unique=True
+    )
+    employee: Mapped[Employee] = relationship()
+    group: Mapped[LivestockGroup] = relationship()
+    reviewer: Mapped[User | None] = relationship()
+    feeds: Mapped[list[AbkDailyReportFeed]] = relationship(
+        cascade="all, delete-orphan", order_by="AbkDailyReportFeed.id"
+    )
+    eggs: Mapped[list[AbkDailyReportEgg]] = relationship(cascade="all, delete-orphan")
+    # Ayam only, optional: eggs that left the farm that day, per customer, as reported by the ABK.
+    egg_outflows: Mapped[list[AbkDailyReportEggOutflow]] = relationship(
+        cascade="all, delete-orphan", order_by="AbkDailyReportEggOutflow.id"
+    )
+    # One per customer, confirmed with prices on approval.
+    egg_sales: Mapped[list[AbkEggSale]] = relationship(back_populates="report", order_by="AbkEggSale.id")
+
+
+class AbkDailyReportFeed(TimestampMixin, Base):
+    __tablename__ = "abk_daily_report_feeds"
+    __table_args__ = (
+        UniqueConstraint("report_id", "feed_type_id"),
+        CheckConstraint(
+            "morning_kg >= 0 AND noon_kg >= 0 AND evening_kg >= 0 AND quantity_kg >= 0 "
+            "AND quantity_kg = morning_kg + noon_kg + evening_kg",
+            name="quantities",
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("abk_daily_reports.id", ondelete="CASCADE"))
+    feed_type_id: Mapped[int] = mapped_column(ForeignKey("feed_types.id", ondelete="RESTRICT"))
+    morning_kg: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=0)
+    noon_kg: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=0)
+    evening_kg: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=0)
+    quantity_kg: Mapped[Decimal] = mapped_column(Numeric(14, 3))
+    feed_type: Mapped[FeedType] = relationship()
+
+
+class AbkDailyReportEgg(TimestampMixin, Base):
+    __tablename__ = "abk_daily_report_eggs"
+    __table_args__ = (
+        UniqueConstraint("report_id", "egg_category"),
+        CheckConstraint("egg_category IN ('UTUH','PECAH','REJECT')", name="category"),
+        CheckConstraint("weight_kg >= 0 AND quantity_pieces >= 0", name="quantities"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("abk_daily_reports.id", ondelete="CASCADE"))
+    egg_category: Mapped[str] = mapped_column(String(10))
+    weight_kg: Mapped[Decimal] = mapped_column(Numeric(14, 3), default=0)
+    quantity_pieces: Mapped[int] = mapped_column(BigInteger, default=0)
+
+
+class AbkDailyReportEggOutflow(TimestampMixin, Base):
+    """Eggs of one category that left the farm for one customer, as the ABK reported them (never
+    edited). A report may have outflows to several customers, each with one to three categories."""
+
+    __tablename__ = "abk_daily_report_egg_outflows"
+    __table_args__ = (
+        UniqueConstraint("report_id", "customer_id", "egg_category"),
+        CheckConstraint("egg_category IN ('UTUH','PECAH','REJECT')", name="category"),
+        CheckConstraint("weight_kg > 0 AND quantity_pieces > 0", name="quantities"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("abk_daily_reports.id", ondelete="CASCADE"))
+    # finance-service customer; its name is copied when the report is submitted.
+    customer_id: Mapped[int] = mapped_column(BigInteger)
+    customer_name: Mapped[str] = mapped_column(String(255))
+    egg_category: Mapped[str] = mapped_column(String(10))
+    weight_kg: Mapped[Decimal] = mapped_column(Numeric(14, 3))
+    quantity_pieces: Mapped[int] = mapped_column(BigInteger)
+
+
+class AbkEggSale(TimestampMixin, Base):
+    """Egg sale to one customer, confirmed by a Superadmin when approving an ABK report, waiting to
+    be (or already) delivered to finance-service, which owns the resulting revenue. A report has one
+    sale per customer, each delivered (and retried, corrected) on its own.
+
+    This is an outbox: operational-service keeps the confirmed customer, quantities and prices only
+    to deliver them reliably (retries after failures, corrections before delivery). It never
+    changes the egg inventory: finance-service reports the sale back through the internal
+    egg-sales inventory API once it records the revenue, like any other egg revenue.
+    """
+
+    __tablename__ = "abk_egg_sales"
+    __table_args__ = (
+        UniqueConstraint("report_id", "customer_id"),
+        CheckConstraint("finance_status IN ('PENDING','SENT','FAILED')", name="finance_status"),
+        CheckConstraint("source_revision > 0 AND attempts >= 0", name="counters"),
+        CheckConstraint(
+            "finance_status <> 'SENT' OR (sent_at IS NOT NULL AND finance_revenue_id IS NOT NULL)", name="sent"
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("abk_daily_reports.id", ondelete="RESTRICT"))
+    transaction_date: Mapped[date] = mapped_column(Date, index=True)
+    customer_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    customer_name: Mapped[str] = mapped_column(String(255))
+    approved_by: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Raised by every correction; finance-service keeps the highest revision it received.
+    source_revision: Mapped[int] = mapped_column(Integer, default=1)
+    finance_status: Mapped[str] = mapped_column(String(10), default="PENDING", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # PENDING only: not retried before this time (back-off after a failed attempt).
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    finance_revenue_id: Mapped[str | None] = mapped_column(String(255))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    report: Mapped[AbkDailyReport] = relationship(back_populates="egg_sales")
+    approver: Mapped[User] = relationship()
+    lines: Mapped[list[AbkEggSaleLine]] = relationship(cascade="all, delete-orphan", order_by="AbkEggSaleLine.id")
+
+
+class AbkEggSaleLine(TimestampMixin, Base):
+    __tablename__ = "abk_egg_sale_lines"
+    __table_args__ = (
+        UniqueConstraint("sale_id", "egg_category"),
+        CheckConstraint("egg_category IN ('UTUH','PECAH','REJECT')", name="category"),
+        CheckConstraint("weight_kg > 0 AND quantity_pieces > 0 AND price_per_kg > 0", name="values"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    sale_id: Mapped[int] = mapped_column(ForeignKey("abk_egg_sales.id", ondelete="CASCADE"))
+    egg_category: Mapped[str] = mapped_column(String(10))
+    weight_kg: Mapped[Decimal] = mapped_column(Numeric(14, 3))
+    quantity_pieces: Mapped[int] = mapped_column(BigInteger)
+    price_per_kg: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+
+
 # --- Lele biomass read model -----------------------------------------------------------------
 # Precomputed by the background rebuild (app.features.lele_biomass_jobs) so that
 # GET /lele-biomass/{group_id} only reads these tables. Never edited by hand: every row of a group

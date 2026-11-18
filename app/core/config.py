@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     jwt_ttl_hours: int = Field(default=8, ge=1, le=24)
     cors_allowed_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
     log_level: str = "INFO"
+    # finance-service internal API (customers for ABK egg outflows, delivery of approved egg sales).
+    # FINANCE_INTERNAL_API_KEY is the X-FM-Internal-Key that finance-service accepts.
+    finance_base_url: str = ""
+    finance_internal_api_key: str = ""
+    finance_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     # Lele biomass analytics: assumed average daily gain (grams per fish per day) used when a group
     # has no real ADG from samplings yet, and the per-fish weight at which a group is ready to sell.
     lele_default_adg_g: Decimal = Field(default=Decimal("1.3"), gt=0)

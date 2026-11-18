@@ -1,0 +1,335 @@
+openapi: 3.1.0
+info:
+  title: finance-service internal API used by operational-service
+  version: 1.0.0
+  description: |
+    Endpoints that **finance-service must implement** so operational-service can (1) let ABK choose
+    the customers of the eggs that left the farm, and (2) hand over the egg sales a Superadmin
+    approved, with their prices, so finance-service records them as revenues (one per customer).
+
+    operational-service is the client. It is already implemented against this document and its
+    tests validate every request it sends against the schemas below.
+
+    ## Authentication
+    Machine-to-machine only: every request carries `X-FM-Internal-Key`. The value is configured in
+    operational-service as `FINANCE_INTERNAL_API_KEY`. Never accept a browser Bearer token here.
+
+    ## Flow of an ABK egg outflow
+    1. The ABK Web App lists customers through operational-service (`GET /internal/customers`,
+       active only) and the ABK submits the daily report with optional egg outflows: **one or more
+       customers**, each with the pieces (butir) and kg per egg category. It is a DRAFT in
+       operational-service.
+    2. A Superadmin approves the report in operational-service, entering `price_per_kg` for each
+       line and optionally correcting, adding, or removing customers, pieces and kg.
+       operational-service checks each customer with `GET /internal/customers/{customer_id}`.
+    3. The approval creates **one sale per customer**, each with its own `source_id`.
+       operational-service delivers each one with `PUT /internal/revenues/egg-sales/{source_id}`
+       right after the approval and retries until it receives a 2xx (or a rejection); the sales of
+       one report are delivered, retried, and corrected independently. finance-service creates
+       (or, for a higher revision, replaces) one revenue per sale. `origin.abk_report_id` tells
+       which sales come from the same daily report.
+    4. **Egg inventory**: operational-service does *not* reduce the egg stock when approving. As
+       for any egg revenue, finance-service reports the sale to operational-service through the
+       existing `PUT /api/v1/internal/inventory/egg-sales/{source_id}` (its own revenue id as
+       source id, `transaction_date` and each line's `egg_category`, `weight_kg`,
+       `quantity_pieces`). This keeps a single path for egg stock leaving with a sale.
+
+    Errors use the platform shape: `{"code": "...", "detail": "...", "errors": {"field": ["..."]}}`.
+servers:
+  - url: http://127.0.0.1:8002
+    description: finance-service (local)
+security:
+  - InternalApiKeyAuth: []
+paths:
+  /api/v1/internal/customers:
+    get:
+      operationId: listCustomers
+      summary: List customers (for the ABK customer picker)
+      description: |
+        Sorted by name. operational-service calls it with `active_only=true` and shows the ABK only
+        `id` and `name`.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: Case-insensitive search on the customer name.
+          schema: {type: string, maxLength: 100}
+        - name: active_only
+          in: query
+          required: false
+          schema: {type: boolean, default: false}
+        - name: page
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, default: 1}
+        - name: per_page
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 100, default: 30}
+      responses:
+        "200":
+          description: One page of customers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: "#/components/schemas/CustomerRef"}
+                  meta: {$ref: "#/components/schemas/PageMeta"}
+              example:
+                data:
+                  - {id: 12, name: "Toko Sumber Rejeki", is_active: true}
+                meta: {page: 1, per_page: 30, total: 1, pages: 1}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /api/v1/internal/customers/{customer_id}:
+    get:
+      operationId: getCustomer
+      summary: Get one customer (validation of a chosen customer)
+      description: "Returns inactive customers too, with `is_active: false`; 404 only when it does not exist."
+      parameters:
+        - name: customer_id
+          in: path
+          required: true
+          schema: {type: integer, minimum: 1}
+      responses:
+        "200":
+          description: The customer.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: {$ref: "#/components/schemas/CustomerRef"}
+              example:
+                data: {id: 12, name: "Toko Sumber Rejeki", is_active: true}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/internal/revenues/egg-sales/{source_id}:
+    put:
+      operationId: upsertEggSaleRevenue
+      summary: Create or replace the revenue of an approved ABK egg sale (one customer)
+      description: |
+        One request per sale, i.e. per customer: a daily report with eggs sold to three customers
+        produces three sources (`abk-egg-sale-41`, `-42`, `-43`) and three revenues. The customer of
+        a source may change in a higher revision (a Superadmin corrected it before delivery).
+
+        **Identity and idempotency** (same rules as operational-service's internal inventory API):
+        a source is identified by (`source_service`, `source_id`).
+
+        - Unknown source: create the revenue, answer 200.
+        - Same `source_revision` and same content: no-op, answer 200 with the stored revenue
+          (operational-service retries after timeouts, so the first request may have succeeded).
+          Compare a canonical form of the body (decimals compared by value, e.g. `12.5` = `12.500`).
+        - Same `source_revision`, different content: 409 `SOURCE_REVISION_CONFLICT`.
+        - Lower `source_revision` than stored: 409 `STALE_SOURCE_REVISION`.
+        - Higher `source_revision`: replace the revenue's date, customer and lines, answer 200.
+
+        operational-service stops sending a source once it received a 2xx: later corrections are made
+        in finance-service. Higher revisions therefore only arrive when a Superadmin corrected a sale
+        that was never confirmed (rejected earlier, or the response was lost).
+
+        **Amounts**: operational-service never sends amounts. finance-service computes each line's
+        amount from `weight_kg` and `price_per_kg` with its own rules (the platform rule so far:
+        `weight_kg * price_per_kg` rounded half-up to whole rupiah) and the revenue total.
+
+        **Validation**: answer 422 with `errors` keyed by the body path (for example
+        `customer_id` or `lines.0.price_per_kg`) when the customer does not exist or is inactive,
+        or a line is invalid. operational-service marks the sale FAILED, shows the error to the
+        Superadmin, and sends a higher revision after the correction.
+
+        **After storing** (create or replace), report the egg outflow to operational-service's
+        existing egg-sales inventory API, as for any egg revenue (see the overview).
+
+        **How operational-service treats the answer**: 2xx delivered (stores `revenue_id`);
+        401, 403, 408, 429, 5xx and network errors are retried with back-off; any other 4xx marks
+        the sale FAILED.
+      parameters:
+        - name: source_id
+          in: path
+          required: true
+          description: Stable id of the sale (one customer) in operational-service, `abk-egg-sale-{id}`.
+          schema: {type: string, minLength: 1, maxLength: 255, pattern: "^abk-egg-sale-[0-9]+$"}
+          example: abk-egg-sale-42
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/EggSaleRevenueInput"}
+            example:
+              source_service: operational-service
+              source_revision: 1
+              transaction_date: "2026-11-17"
+              customer_id: 12
+              lines:
+                - {source_line_id: UTUH, egg_category: UTUH, quantity_pieces: 200, weight_kg: "12.500", price_per_kg: "28000.00"}
+                - {source_line_id: PECAH, egg_category: PECAH, quantity_pieces: 15, weight_kg: "0.900", price_per_kg: "18000.00"}
+              origin:
+                abk_report_id: 7
+                daily_record_id: 105
+                submitted_by_employee_id: 3
+                approved_by_user_id: 1
+                approved_at: "2026-11-17T10:15:00+00:00"
+      responses:
+        "200":
+          description: Stored (created, replaced, or an identical retry).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: {$ref: "#/components/schemas/EggSaleRevenueResult"}
+              example:
+                data: {revenue_id: "84", source_revision: 1}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409":
+          description: "`SOURCE_REVISION_CONFLICT` or `STALE_SOURCE_REVISION`."
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: "#/components/schemas/Error"}
+                  - type: object
+                    properties:
+                      current_revision: {type: integer}
+              example: {code: STALE_SOURCE_REVISION, detail: "The source revision is older than the stored revision.", current_revision: 2}
+        "422":
+          description: Invalid sale (unknown or inactive customer, invalid line).
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+              example: {code: VALIDATION_ERROR, detail: "The request is invalid.", errors: {customer_id: ["Customer is inactive."]}}
+components:
+  securitySchemes:
+    InternalApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-FM-Internal-Key
+  responses:
+    Unauthorized:
+      description: Missing or invalid `X-FM-Internal-Key`.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {code: INVALID_INTERNAL_API_KEY, detail: "Authentication credentials are invalid."}
+    NotFound:
+      description: Not found.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {code: NOT_FOUND, detail: "Customer was not found."}
+  schemas:
+    CustomerRef:
+      type: object
+      required: [id, name, is_active]
+      properties:
+        id: {type: integer, minimum: 1}
+        name: {type: string, minLength: 1, maxLength: 255}
+        is_active: {type: boolean}
+    PageMeta:
+      type: object
+      required: [page, per_page, total, pages]
+      properties:
+        page: {type: integer}
+        per_page: {type: integer}
+        total: {type: integer}
+        pages: {type: integer}
+    EggSaleRevenueInput:
+      type: object
+      additionalProperties: false
+      required: [source_service, source_revision, transaction_date, customer_id, lines, origin]
+      properties:
+        source_service:
+          type: string
+          const: operational-service
+        source_revision:
+          type: integer
+          minimum: 1
+          description: Increases with every correction of the sale in operational-service.
+        transaction_date:
+          type: string
+          format: date
+          description: The ABK report's record date (the day the eggs left the farm).
+        customer_id:
+          type: integer
+          minimum: 1
+          description: finance-service customer id.
+        lines:
+          type: array
+          minItems: 1
+          maxItems: 3
+          description: One line per egg category; categories are unique within a sale.
+          items: {$ref: "#/components/schemas/EggSaleRevenueLine"}
+        origin:
+          $ref: "#/components/schemas/EggSaleOrigin"
+    EggSaleRevenueLine:
+      type: object
+      additionalProperties: false
+      required: [source_line_id, egg_category, quantity_pieces, weight_kg, price_per_kg]
+      properties:
+        source_line_id:
+          type: string
+          description: Stable line id within the source; equal to the egg category.
+          enum: [UTUH, PECAH, REJECT]
+        egg_category:
+          type: string
+          enum: [UTUH, PECAH, REJECT]
+        quantity_pieces:
+          type: integer
+          minimum: 1
+          description: Pieces (butir).
+        weight_kg:
+          type: string
+          pattern: "^[0-9]+\\.[0-9]{3}$"
+          description: Decimal string, 3 decimals, greater than zero.
+          example: "12.500"
+        price_per_kg:
+          type: string
+          pattern: "^[0-9]+\\.[0-9]{2}$"
+          description: Rupiah per kg, decimal string, 2 decimals, greater than zero.
+          example: "28000.00"
+    EggSaleOrigin:
+      type: object
+      additionalProperties: false
+      description: |
+        Where the sale comes from, for finance-service's audit trail. Ids only, so a retry always
+        sends identical content. Resolve the employee with operational-service's
+        `GET /api/v1/internal/references/employees/{employee_id}`; `approved_by_user_id` is a platform
+        user id (the JWT `sub`).
+      required: [abk_report_id, daily_record_id, submitted_by_employee_id, approved_by_user_id, approved_at]
+      properties:
+        abk_report_id:
+          type: integer
+          minimum: 1
+          description: The daily report; shared by the sales to the different customers of that day.
+        daily_record_id: {type: integer, minimum: 1}
+        submitted_by_employee_id: {type: integer, minimum: 1}
+        approved_by_user_id: {type: integer, minimum: 1}
+        approved_at: {type: string, format: date-time}
+    EggSaleRevenueResult:
+      type: object
+      required: [revenue_id, source_revision]
+      properties:
+        revenue_id:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: finance-service revenue id (as a string), shown in operational-service.
+        source_revision:
+          type: integer
+          description: The revision now stored.
+    Error:
+      type: object
+      required: [code, detail]
+      properties:
+        code: {type: string}
+        detail: {type: string}
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items: {type: string}

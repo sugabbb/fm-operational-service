@@ -26,6 +26,13 @@ def test_schema_contains_only_operational_tables() -> None:
         "lele_biomass_chart_dates",
         "lele_biomass_chart_series",
         "lele_biomass_chart_values",
+        "abk_accounts",
+        "abk_daily_reports",
+        "abk_daily_report_feeds",
+        "abk_daily_report_eggs",
+        "abk_daily_report_egg_outflows",
+        "abk_egg_sales",
+        "abk_egg_sale_lines",
     }
 
 

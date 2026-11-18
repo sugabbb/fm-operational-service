@@ -11,6 +11,7 @@ dependencies = [
   "alembic==1.17.2",
   "email-validator==2.3.0",
   "fastapi==0.121.3",
+  "httpx==0.28.1",
   "psycopg[binary]==3.2.13",
   "pydantic-settings==2.12.0",
   "pwdlib[argon2]==0.3.0",
@@ -24,11 +25,14 @@ include = ["app*"]
 
 [project.optional-dependencies]
 dev = [
-  "httpx==0.28.1",
+  "jsonschema==4.25.1",
   "mypy==1.18.2",
+  "openapi-spec-validator==0.7.2",
   "pytest==9.0.1",
   "pytest-cov==7.0.0",
+  "PyYAML==6.0.3",
   "ruff==0.14.6",
+  "types-PyYAML==6.0.12.20250915",
 ]
 
 [tool.pytest.ini_options]

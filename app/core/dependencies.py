@@ -1,15 +1,21 @@
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import Depends, Header
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.errors import AppError, forbidden
-from app.core.security import decode_access_token, valid_internal_api_key
-from app.db.models import User
+from app.core.security import decode_access_token, valid_internal_api_key, verify_pin
+from app.db.models import AbkAccount, User
 from app.db.session import get_db
 
 bearer_scheme = HTTPBearer(auto_error=False, scheme_name="BearerAuth")
+abk_username_scheme = APIKeyHeader(name="X-ABK-Username", auto_error=False, scheme_name="AbkUsername")
+abk_pin_scheme = APIKeyHeader(name="X-ABK-PIN", auto_error=False, scheme_name="AbkPin")
+ABK_PIN_MAX_ATTEMPTS = 5
+ABK_PIN_LOCK = timedelta(minutes=15)
 DbSession = Annotated[Session, Depends(get_db)]
 
 
@@ -57,3 +63,51 @@ def superadmin(user: ActiveUser) -> User:
 
 
 Superadmin = Annotated[User, Depends(superadmin)]
+
+
+def current_abk(
+    db: DbSession,
+    username: Annotated[str | None, Depends(abk_username_scheme)],
+    pin: Annotated[str | None, Depends(abk_pin_scheme)],
+) -> AbkAccount:
+    """ABK Web App authentication: no login and no token, every request carries the ABK username
+    and PIN. Wrong, unknown, and inactive credentials get the same answer. After
+    ABK_PIN_MAX_ATTEMPTS consecutive wrong PINs the account is locked for ABK_PIN_LOCK; a correct
+    PIN or an Admin PIN reset clears the counter."""
+    invalid = AppError(401, "INVALID_ABK_CREDENTIALS", "Username or PIN is invalid.")
+    if not username or not pin:
+        raise invalid
+    now = datetime.now(UTC)
+    account = db.scalar(
+        select(AbkAccount)
+        .where(AbkAccount.username == username.strip().lower())
+        .options(selectinload(AbkAccount.employee))
+        .with_for_update()
+    )
+    if account and account.locked_until and account.locked_until > now:
+        locked_until = account.locked_until.isoformat()
+        db.rollback()
+        raise AppError(
+            429,
+            "ABK_PIN_LOCKED",
+            "Too many invalid PIN attempts. Try again later.",
+            extra={"locked_until": locked_until},
+        )
+    valid = verify_pin(pin, account.pin_hash if account else None)
+    if account and not valid:
+        account.failed_pin_attempts += 1
+        if account.failed_pin_attempts >= ABK_PIN_MAX_ATTEMPTS:
+            account.failed_pin_attempts = 0
+            account.locked_until = now + ABK_PIN_LOCK
+        db.commit()
+    if not account or not valid or not account.is_active or account.employee.status != "ACTIVE":
+        db.rollback()
+        raise invalid
+    account.failed_pin_attempts = 0
+    account.locked_until = None
+    account.last_authenticated_at = now
+    db.commit()
+    return account
+
+
+CurrentAbk = Annotated[AbkAccount, Depends(current_abk)]

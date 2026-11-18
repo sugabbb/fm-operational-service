@@ -10,6 +10,8 @@ os.environ.setdefault(
 os.environ.setdefault("API_KEY", "test-api-key-with-at-least-24-characters")
 os.environ.setdefault("INTERNAL_API_KEY", "test-internal-key-with-at-least-24-characters")
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-with-at-least-thirty-two-characters")
+os.environ.setdefault("FINANCE_BASE_URL", "http://finance.test")
+os.environ.setdefault("FINANCE_INTERNAL_API_KEY", "test-finance-key-with-at-least-24-characters")
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -31,4 +33,3 @@ def clean_database() -> Iterator[None]:
         yield
     finally:
         Base.metadata.drop_all(engine)
-

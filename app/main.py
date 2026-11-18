@@ -15,6 +15,9 @@ from app.core.config import settings
 from app.core.errors import AppError
 from app.db.session import SessionLocal
 from app.features import (
+    abk,
+    abk_admin,
+    abk_egg_sales,
     auth,
     farm,
     internal_references,
@@ -49,7 +52,7 @@ if settings.cors_allowed_origins:
         allow_origins=settings.cors_allowed_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", "X-ABK-Username", "X-ABK-PIN"],
     )
 
 
@@ -103,6 +106,9 @@ for feature_router in (
     farm.router,
     lele_biomass.router,
     settings_feature.router,
+    abk.router,
+    abk_admin.router,
+    abk_egg_sales.router,
     inventory_integration.router,
     internal_references.router,
 ):
@@ -120,6 +126,9 @@ def custom_openapi() -> dict[str, Any]:
         "in": "header",
         "name": "X-FM-Internal-Key",
     }
+    # ABK Web App: no login, both headers on every request.
+    security_schemes["AbkUsername"] = {"type": "apiKey", "in": "header", "name": "X-ABK-Username"}
+    security_schemes["AbkPin"] = {"type": "apiKey", "in": "header", "name": "X-ABK-PIN"}
     for path, operations in schema.get("paths", {}).items():
         for operation in operations.values():
             if not isinstance(operation, dict):
@@ -128,6 +137,8 @@ def custom_openapi() -> dict[str, Any]:
                 operation.pop("security", None)
             elif path.startswith("/api/v1/internal/"):
                 operation["security"] = [{"InternalApiKeyAuth": []}]
+            elif path.startswith("/api/v1/abk/"):
+                operation["security"] = [{"AbkUsername": [], "AbkPin": []}]
             elif path.startswith("/api/v1/"):
                 operation["security"] = [{"BearerAuth": []}]
             else:

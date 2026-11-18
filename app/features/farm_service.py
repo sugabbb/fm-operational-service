@@ -1,6 +1,8 @@
 import re
 import unicodedata
+from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import delete, func, select, text
@@ -21,6 +23,7 @@ from app.features.common import audit, model_snapshot, today_local
 from app.features.lele_biomass_queue import enqueue as enqueue_biomass
 
 ADVISORY_LOCK = 20261009
+EGG_CATEGORIES = ("UTUH", "PECAH", "REJECT")
 
 
 def lock_balances(db: Session) -> None:
@@ -86,13 +89,36 @@ def available_code(db: Session, base: str) -> str:
     return candidate
 
 
-def replace_daily_children(db: Session, record: DailyRecord, species: str, data: dict[str, Any]) -> None:
-    db.execute(delete(FeedUsage).where(FeedUsage.daily_record_id == record.id))
-    db.execute(delete(EggHarvest).where(EggHarvest.daily_record_id == record.id))
+@dataclass(frozen=True)
+class DailyFeedLine:
+    feed_type_id: int
+    morning_kg: Decimal
+    noon_kg: Decimal
+    evening_kg: Decimal
+
+    @property
+    def quantity_kg(self) -> Decimal:
+        return self.morning_kg + self.noon_kg + self.evening_kg
+
+
+@dataclass(frozen=True)
+class DailyEggLine:
+    egg_category: str
+    weight_kg: Decimal
+    quantity_pieces: int
+
+
+def validate_daily_lines(
+    db: Session, species: str, data: dict[str, Any]
+) -> tuple[list[DailyFeedLine], list[DailyEggLine]]:
+    """Validates the feed and egg lines of one daily record and returns them normalized.
+
+    Shared by admin daily records and ABK daily reports so both follow the same rules."""
     seen: set[int] = set()
     feeds = data.get("feeds") or []
     if not feeds:
         raise validation("feeds", "At least one feed type is required.")
+    feed_lines: list[DailyFeedLine] = []
     for index, item in enumerate(feeds):
         feed_id = int(item["feed_type_id"])
         if feed_id in seen:
@@ -106,32 +132,44 @@ def replace_daily_children(db: Session, record: DailyRecord, species: str, data:
         evening = quantity(item.get("evening_kg", 0))
         if species == "AYAM" and evening != 0:
             raise validation(f"feeds.{index}.evening_kg", "Ayam has only morning and noon feed periods.")
+        feed_lines.append(DailyFeedLine(feed_id, morning, noon, evening))
+    egg_lines: list[DailyEggLine] = []
+    if species == "AYAM":
+        eggs = data.get("eggs") or {}
+        for category in EGG_CATEGORIES:
+            egg = eggs.get(category)
+            if egg is None:
+                raise validation(f"eggs.{category}", "All egg categories are required for Ayam.")
+            egg_lines.append(DailyEggLine(category, quantity(egg["weight_kg"]), int(egg["quantity_pieces"])))
+    elif data.get("eggs"):
+        raise validation("eggs", "Egg harvests are not valid for Lele.")
+    return feed_lines, egg_lines
+
+
+def replace_daily_children(db: Session, record: DailyRecord, species: str, data: dict[str, Any]) -> None:
+    feed_lines, egg_lines = validate_daily_lines(db, species, data)
+    db.execute(delete(FeedUsage).where(FeedUsage.daily_record_id == record.id))
+    db.execute(delete(EggHarvest).where(EggHarvest.daily_record_id == record.id))
+    for line in feed_lines:
         db.add(
             FeedUsage(
                 daily_record_id=record.id,
-                feed_type_id=feed_id,
-                morning_kg=morning,
-                noon_kg=noon,
-                evening_kg=evening,
-                quantity_kg=morning + noon + evening,
+                feed_type_id=line.feed_type_id,
+                morning_kg=line.morning_kg,
+                noon_kg=line.noon_kg,
+                evening_kg=line.evening_kg,
+                quantity_kg=line.quantity_kg,
             )
         )
-    if species == "AYAM":
-        eggs = data.get("eggs") or {}
-        for category in ("UTUH", "PECAH", "REJECT"):
-            item = eggs.get(category)
-            if item is None:
-                raise validation(f"eggs.{category}", "All egg categories are required for Ayam.")
-            db.add(
-                EggHarvest(
-                    daily_record_id=record.id,
-                    egg_category=category,
-                    weight_kg=quantity(item["weight_kg"]),
-                    quantity_pieces=item["quantity_pieces"],
-                )
+    for egg in egg_lines:
+        db.add(
+            EggHarvest(
+                daily_record_id=record.id,
+                egg_category=egg.egg_category,
+                weight_kg=egg.weight_kg,
+                quantity_pieces=egg.quantity_pieces,
             )
-    elif data.get("eggs"):
-        raise validation("eggs", "Egg harvests are not valid for Lele.")
+        )
 
 
 def save_daily(db: Session, species: str, rows: list[dict[str, Any]], actor: User) -> list[DailyRecord]:

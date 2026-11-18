@@ -82,3 +82,20 @@ def temporary_password(length: int = 18) -> str:
         value = "".join(secrets.choice(alphabet) for _ in range(length))
         if any(c.isalpha() for c in value) and any(c.isdigit() for c in value):
             return value
+
+
+ABK_PIN_LENGTH = 6
+
+
+def generate_pin() -> str:
+    """Random numeric PIN for an ABK account, issued by an Admin and shown once."""
+    return "".join(secrets.choice("0123456789") for _ in range(ABK_PIN_LENGTH))
+
+
+def hash_pin(pin: str) -> str:
+    return password_hash.hash(pin)
+
+
+def verify_pin(pin: str, encoded: str | None) -> bool:
+    """Constant work whether or not the account exists (unknown usernames verify a dummy hash)."""
+    return password_hash.verify(pin, encoded or DUMMY_HASH)
