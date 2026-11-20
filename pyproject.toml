@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "fm-operational-service"
 version = "1.0.0"
 description = "Synchronous operational farm-management service for Farm Management"
+license = "MIT"
 requires-python = ">=3.14,<3.15"
 dependencies = [
   "alembic==1.17.2",

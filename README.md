@@ -2,6 +2,10 @@
 
 Independent synchronous FastAPI/PostgreSQL service for non-monetary daily farm operations. It owns authentication, users, employees, ABK Web App access and ABK daily-record submissions awaiting approval, livestock groups, the layer (laying hen) vaccination and medicine program with the ABK reminders, daily records, feed and egg inventory, Lele sampling, and the Lele biomass read model. It intentionally contains no cashflow, revenue, customer, payment, loan, cash-account, statement, report, or proof-upload feature. The one money value it handles is the price per kg a Superadmin enters when approving an ABK egg outflow: it is kept only to deliver that sale to finance-service, which owns the revenue (see [ABK egg outflows](#abk-egg-outflows-and-finance-service)).
 
+## License
+
+Copyright (c) 2026 Bagus Pribadi. This project is open source and available under the [MIT License](LICENSE).
+
 ## Runtime and setup
 
 - Python 3.14
