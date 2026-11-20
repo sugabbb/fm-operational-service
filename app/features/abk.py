@@ -7,7 +7,7 @@ population or biomass figure until an Admin/Superadmin approves it (``abk_admin`
 the real daily record.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Query, status
@@ -32,9 +32,10 @@ from app.db.models import (
 )
 from app.features import finance_client
 from app.features.abk_egg_sales import MAX_CUSTOMERS, EggOutflowInput, sale_out, unique_customers
-from app.features.common import audit
-from app.features.farm import DailyRow
+from app.features.common import audit, today_local
+from app.features.farm import DailyRow, current_age
 from app.features.farm_service import EGG_CATEGORIES, population, validate_daily_lines
+from app.features.layer_health_reminders import REMINDER_DAYS, active_ayam_group, stored_reminders
 
 router = APIRouter(prefix="/abk", tags=["ABK Web App"])
 
@@ -225,6 +226,9 @@ def form_options(account: CurrentAbk, db: DbSession) -> dict[str, object]:
                     "name": group.name,
                     "location": group.location,
                     "start_date": group.start_date.isoformat(),
+                    # Ayam only (null for Lele): age on arrival and today, in weeks and day of the week.
+                    "arrival_age_week": group.arrival_age_week,
+                    "current_age": current_age(group),
                 }
                 for group in groups
             ],
@@ -365,3 +369,41 @@ def my_daily_reports(
 def my_daily_report(report_id: int, account: CurrentAbk, db: DbSession) -> dict[str, object]:
     """One report this ABK submitted; another ABK's report answers 404 like a missing one."""
     return {"data": abk_report_out(load_own_report(db, account, report_id))}
+
+
+@router.get("/layer-health-reminders")
+def layer_health_reminders(
+    account: CurrentAbk,
+    db: DbSession,
+    days: int = Query(
+        default=REMINDER_DAYS, ge=0, le=REMINDER_DAYS, description="How many days after today to include (0-7)."
+    ),
+    group_id: int | None = Query(default=None, description="Only this group (default: every active Ayam group)."),
+    include_snoozed: bool = Query(
+        default=False, description="Also list the tasks no longer reminded (already recorded), with snoozed_at."
+    ),
+) -> dict[str, object]:
+    """The vaccinations and medicines to give today and on the next ``days`` days, per active Ayam
+    group, as prepared by the nightly job from the farm's layer health program. Each date is listed,
+    each with every active group (with its age that day), also a group without any task; the coming
+    days let the ABK prepare (buy the vaccine, stop chlorinating the water, ...).
+
+    A vaccination can be given on any day of its age week: it is listed on each of those days, with
+    ``window`` (from, to, and which day of the 7 it is). A medicine course over several days has a
+    task on each day, with ``course`` telling which day it is.
+
+    Record a task with ``POST /abk/layer-health-activities`` (its ``key``). Its occurrence is then
+    snoozed and left out: a vaccination for the rest of its week, a medicine for that course day."""
+    require_scope(account, "AYAM", "Vaccination and medicine reminders are only for ABK assigned to chicken (Ayam).")
+    if group_id is not None and not active_ayam_group(db, group_id):
+        raise validation("group_id", "Group must be an active Ayam group.")
+    today = today_local()
+    data = stored_reminders(
+        db,
+        today,
+        today + timedelta(days=days),
+        group_id=group_id,
+        active_groups_only=True,
+        include_snoozed=include_snoozed,
+    )
+    return {"data": data}

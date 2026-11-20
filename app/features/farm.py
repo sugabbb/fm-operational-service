@@ -12,6 +12,7 @@ from app.core.dependencies import ActiveUser, DbSession, Superadmin
 from app.core.errors import conflict, not_found, validation
 from app.core.pagination import PageDep, StrictModel
 from app.db.models import (
+    DEFAULT_ARRIVAL_AGE_WEEK,
     DailyRecord,
     EggHarvest,
     ExternalInventoryLine,
@@ -35,6 +36,7 @@ from app.features.farm_service import (
     save_daily,
     update_daily,
 )
+from app.features.layer_health_schedule import age_on
 from app.features.lele_biomass_jobs import drain_in_background as rebuild_biomass_in_background
 from app.features.lele_biomass_queue import enqueue as enqueue_biomass
 from app.features.lele_biomass_queue import enqueue_id as enqueue_biomass_id
@@ -47,6 +49,12 @@ router = APIRouter(tags=["Farm Operations"])
 InitialWeightG = Annotated[Decimal, Field(gt=0, le=Decimal("100000"))]
 
 
+# Age of the hens on arrival, in whole weeks (Ayam only). The layer health program is timed by it.
+ArrivalAgeWeek = Annotated[
+    int, Field(ge=0, le=200, description="Ayam only: age of the hens, in whole weeks, on the start date.")
+]
+
+
 class GroupCreate(StrictModel):
     species: Literal["AYAM", "LELE"]
     code: str | None = Field(default=None, max_length=255)
@@ -54,6 +62,8 @@ class GroupCreate(StrictModel):
     start_date: date
     initial_population: int = Field(ge=0)
     initial_weight_g: InitialWeightG | None = None
+    # Omitted for Ayam: DEFAULT_ARRIVAL_AGE_WEEK (13).
+    arrival_age_week: ArrivalAgeWeek | None = None
     location: str = Field(min_length=1, max_length=255)
     notes: str | None = Field(default=None, max_length=3000)
 
@@ -64,6 +74,8 @@ class GroupUpdate(StrictModel):
     initial_population: int = Field(ge=0)
     # Omitted: keep the stored value (so clients unaware of the field never erase it); null: clear it.
     initial_weight_g: InitialWeightG | None = None
+    # Omitted: unchanged. Changing it moves the whole layer health program of the group.
+    arrival_age_week: ArrivalAgeWeek | None = None
     location: str = Field(min_length=1, max_length=255)
     notes: str | None = Field(default=None, max_length=3000)
 
@@ -178,12 +190,21 @@ def group_out(db: DbSession, row: LivestockGroup) -> dict[str, object]:
         "initial_population": row.initial_population,
         "initial_weight_g": decimal_string(row.initial_weight_g),
         "current_population": population(db, row, row.closed_at),
+        "arrival_age_week": row.arrival_age_week,
+        "current_age": current_age(row),
         "location": row.location,
         "status": row.status,
         "closed_at": row.closed_at.isoformat() if row.closed_at else None,
         "closure_reason": row.closure_reason,
         "notes": row.notes,
     }
+
+
+def current_age(row: LivestockGroup) -> dict[str, int] | None:
+    """Age of an Ayam group today (on its closing date once closed), as age week and day (1-7);
+    None for Lele and before the start date."""
+    age = age_on(row, row.closed_at or today_local())
+    return age.out() if age else None
 
 
 def daily_out(row: DailyRecord) -> dict[str, object]:
@@ -273,6 +294,7 @@ def create_group(
 ) -> dict[str, object]:
     values = payload.model_dump()
     values["initial_weight_g"] = initial_weight(payload.species, payload.initial_weight_g)
+    values["arrival_age_week"] = arrival_age(payload.species, payload.arrival_age_week, default=True)
     submitted = normalize_code(values.pop("code") or "")
     base = normalize_code(
         f"{payload.location}-{payload.name}" if payload.species == "LELE" else f"{payload.name}-{payload.location}"
@@ -315,6 +337,8 @@ def update_group(
         weight = initial_weight(row.species, payload.initial_weight_g)
         weight_changed = weight != row.initial_weight_g
         row.initial_weight_g = weight
+    if "arrival_age_week" in payload.model_fields_set:
+        row.arrival_age_week = arrival_age(row.species, payload.arrival_age_week)
     if weight_changed:
         db.flush()
         refresh_group_results(db, row.id)
@@ -323,6 +347,18 @@ def update_group(
     db.commit()
     background_tasks.add_task(rebuild_biomass_in_background)
     return {"data": group_out(db, row)}
+
+
+def arrival_age(species: str, value: int | None, *, default: bool = False) -> int | None:
+    if species != "AYAM":
+        if value is not None:
+            raise validation("arrival_age_week", "Arrival age is only valid for Ayam.")
+        return None
+    if value is None:
+        if not default:
+            raise validation("arrival_age_week", "Arrival age is required for Ayam.")
+        return DEFAULT_ARRIVAL_AGE_WEEK
+    return value
 
 
 def initial_weight(species: str, value: Decimal | None) -> Decimal | None:

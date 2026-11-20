@@ -33,6 +33,12 @@ def test_schema_contains_only_operational_tables() -> None:
         "abk_daily_report_egg_outflows",
         "abk_egg_sales",
         "abk_egg_sale_lines",
+        "layer_vaccinations",
+        "layer_medicine_programs",
+        "layer_health_daily_reminders",
+        "layer_health_daily_reminder_tasks",
+        "layer_health_reminder_snoozes",
+        "layer_health_daily_activities",
     }
 
 

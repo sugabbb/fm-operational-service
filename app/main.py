@@ -22,6 +22,8 @@ from app.features import (
     farm,
     internal_references,
     inventory_integration,
+    layer_health,
+    layer_health_activities,
     lele_biomass,
     people,
 )
@@ -53,6 +55,8 @@ if settings.cors_allowed_origins:
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-ABK-Username", "X-ABK-PIN"],
+        # Lets the frontend read the file name of downloads (the vaccination Excel template).
+        expose_headers=["Content-Disposition"],
     )
 
 
@@ -106,7 +110,10 @@ for feature_router in (
     farm.router,
     lele_biomass.router,
     settings_feature.router,
+    layer_health.router,
+    layer_health_activities.router,
     abk.router,
+    layer_health_activities.abk_router,
     abk_admin.router,
     abk_egg_sales.router,
     inventory_integration.router,

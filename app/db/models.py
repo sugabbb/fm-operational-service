@@ -57,6 +57,15 @@ class Employee(TimestampMixin, Base):
     notes: Mapped[str | None] = mapped_column(Text)
 
 
+# Age (weeks) on arrival of the Ayam groups that existed before the age was recorded, and of new
+# groups created without one.
+DEFAULT_ARRIVAL_AGE_WEEK = 13
+
+
+def default_arrival_age_week(context: Any) -> int | None:
+    return DEFAULT_ARRIVAL_AGE_WEEK if context.get_current_parameters().get("species") == "AYAM" else None
+
+
 class LivestockGroup(TimestampMixin, Base):
     __tablename__ = "livestock_groups"
     __table_args__ = (
@@ -64,6 +73,11 @@ class LivestockGroup(TimestampMixin, Base):
         CheckConstraint("status IN ('ACTIVE','CLOSED')", name="status"),
         CheckConstraint(
             "initial_weight_g IS NULL OR (species = 'LELE' AND initial_weight_g > 0)", name="initial_weight"
+        ),
+        CheckConstraint(
+            "(species = 'AYAM' AND arrival_age_week IS NOT NULL AND arrival_age_week >= 0)"
+            " OR (species <> 'AYAM' AND arrival_age_week IS NULL)",
+            name="arrival_age_week",
         ),
     )
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -75,6 +89,9 @@ class LivestockGroup(TimestampMixin, Base):
     # Lele only: average weight of one fish (grams) on start_date. When set, it is the starting
     # point of the group's first real ADG interval (stocking -> first sampling).
     initial_weight_g: Mapped[Decimal | None] = mapped_column(Numeric(12, 3))
+    # Ayam only (required): age of the hens, in whole weeks, when they arrived on start_date. Their
+    # age on any later date follows from it; the layer health program is timed by that age.
+    arrival_age_week: Mapped[int | None] = mapped_column(Integer, default=default_arrival_age_week)
     location: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(20), default="ACTIVE", index=True)
     closed_at: Mapped[date | None] = mapped_column(Date)
@@ -666,3 +683,276 @@ class LeleBiomassChartValue(Base):
     )
     chart_date: Mapped[date] = mapped_column(Date, primary_key=True)
     weight_g: Mapped[Decimal] = mapped_column(Numeric(12, 3))
+
+
+# --- Layer health program --------------------------------------------------------------------
+# Farm-wide vaccination schedule and medicine program for the laying hens (Ayam groups), the same for
+# every group and editable at any time. Everything is timed by the hens' age, never by the calendar:
+# a group's age on a date is its ``arrival_age_week`` on its ``start_date`` plus the days since then
+# (see app.features.layer_health_schedule). The same program therefore lines up with every group,
+# whatever age it arrived at. The ABK daily reminders are computed from these tables.
+#
+# Rows are never deleted: an item that no longer applies is deactivated, so anything recorded
+# against it later keeps its reference.
+
+LAYER_HEALTH_METHODS = (
+    "EYE_DROP",
+    "NASAL_DROP",
+    "ORAL",
+    "DRINKING_WATER",
+    "FEED",
+    "SPRAY",
+    "INTRAMUSCULAR",
+    "SUBCUTANEOUS",
+    "WING_WEB",
+    "OTHER",
+)
+LAYER_HEALTH_METHODS_SQL = ",".join(f"'{method}'" for method in LAYER_HEALTH_METHODS)
+
+
+class LayerVaccination(TimestampMixin, Base):
+    """One vaccine to give on the first day of age week ``age_week``, with how to give it."""
+
+    __tablename__ = "layer_vaccinations"
+    __table_args__ = (
+        CheckConstraint("age_week >= 0", name="age_week"),
+        CheckConstraint(f"method IN ({LAYER_HEALTH_METHODS_SQL})", name="method"),
+        # The same vaccine once per age; names are compared case-insensitively.
+        Index("uq_layer_vaccinations_age_vaccine", "age_week", text("lower(vaccine_name)"), unique=True),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    age_week: Mapped[int] = mapped_column(Integer, index=True)
+    vaccine_name: Mapped[str] = mapped_column(String(255))
+    # Diseases the vaccine protects against, e.g. "ND, IB".
+    target_disease: Mapped[str | None] = mapped_column(String(255))
+    method: Mapped[str] = mapped_column(String(20))
+    # Free text as written on the product or by the vet, e.g. "1 tetes/ekor" or "0,5 ml/ekor".
+    dosage: Mapped[str | None] = mapped_column(String(255))
+    notes: Mapped[str | None] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class LayerMedicineProgram(TimestampMixin, Base):
+    """Guideline of one medicine, timed by the hens' age.
+
+    The first course starts on day ``start_day`` (1-7) of age week ``start_age_week``. A course lasts
+    ``course_days`` consecutive days and starts again every ``interval_value`` ``interval_unit``
+    (DAY, WEEK, or MONTH = 4 age weeks), counted from the start of the previous course.
+    """
+
+    __tablename__ = "layer_medicine_programs"
+    __table_args__ = (
+        CheckConstraint("start_age_week >= 0", name="start_age_week"),
+        CheckConstraint("start_day BETWEEN 1 AND 7", name="start_day"),
+        CheckConstraint("interval_value > 0", name="interval_value"),
+        CheckConstraint("interval_unit IN ('DAY','WEEK','MONTH')", name="interval_unit"),
+        # A course never runs into the next one.
+        CheckConstraint(
+            "course_days > 0 AND course_days <= interval_value * "
+            "CASE interval_unit WHEN 'DAY' THEN 1 WHEN 'WEEK' THEN 7 ELSE 28 END",
+            name="course_days",
+        ),
+        CheckConstraint(f"method IN ({LAYER_HEALTH_METHODS_SQL})", name="method"),
+        Index("uq_layer_medicine_programs_name", text("lower(medicine_name)"), unique=True),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    medicine_name: Mapped[str] = mapped_column(String(255))
+    # What it is given for, e.g. "Vitamin", "Obat cacing".
+    purpose: Mapped[str | None] = mapped_column(String(255))
+    method: Mapped[str] = mapped_column(String(20))
+    dosage: Mapped[str | None] = mapped_column(String(255))
+    start_age_week: Mapped[int] = mapped_column(Integer)
+    start_day: Mapped[int] = mapped_column(SmallInteger, default=1)
+    course_days: Mapped[int] = mapped_column(SmallInteger, default=1)
+    interval_value: Mapped[int] = mapped_column(Integer)
+    interval_unit: Mapped[str] = mapped_column(String(10))
+    notes: Mapped[str | None] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class LayerHealthDailyReminder(Base):
+    """One active Ayam group on one date: the hens' age and the tasks of the layer health program.
+
+    Read model written only by the nightly job (app.features.layer_health_reminders.rebuild), which
+    replaces every row from its run date to LAYER_HEALTH_REMINDER_DAYS days later with the program
+    and groups of that moment. Each active group has a row for every date from its start date, also
+    without any task. Rows of earlier dates are kept as they were last computed: what the ABK were
+    reminded of that day.
+    """
+
+    __tablename__ = "layer_health_daily_reminders"
+    __table_args__ = (
+        UniqueConstraint("group_id", "reminder_date"),
+        CheckConstraint("age_week >= 0 AND age_day BETWEEN 1 AND 7", name="age"),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("livestock_groups.id", ondelete="CASCADE"))
+    reminder_date: Mapped[date] = mapped_column(Date, index=True)
+    age_week: Mapped[int] = mapped_column(Integer)
+    age_day: Mapped[int] = mapped_column(SmallInteger)
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    group: Mapped[LivestockGroup] = relationship()
+    tasks: Mapped[list[LayerHealthDailyReminderTask]] = relationship(
+        back_populates="reminder",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="LayerHealthDailyReminderTask.position",
+    )
+
+
+class LayerHealthDailyReminderTask(Base):
+    """One vaccination or medicine to give, with the program details copied when it was computed.
+
+    A vaccination can be given on any day of its age week (window_start..window_end) and is listed on
+    each of them; a medicine course has a task on each of its days (course_day of course_days). A task
+    whose occurrence is snoozed is no longer reminded.
+    """
+
+    __tablename__ = "layer_health_daily_reminder_tasks"
+    __table_args__ = (
+        UniqueConstraint("reminder_id", "position"),
+        CheckConstraint("type IN ('VACCINATION','MEDICINE')", name="type"),
+        CheckConstraint(
+            "(type = 'VACCINATION' AND vaccination_id IS NOT NULL AND medicine_id IS NULL"
+            " AND window_start IS NOT NULL AND window_end = window_start + 6"
+            " AND course_day IS NULL AND course_days IS NULL)"
+            " OR (type = 'MEDICINE' AND medicine_id IS NOT NULL AND vaccination_id IS NULL"
+            " AND window_start IS NULL AND window_end IS NULL"
+            " AND course_day BETWEEN 1 AND course_days)",
+            name="shape",
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # Explicit names: the conventional ones exceed PostgreSQL's 63 characters.
+    reminder_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "layer_health_daily_reminders.id",
+            ondelete="CASCADE",
+            name="fk_layer_health_daily_reminder_tasks_reminder_id",
+        ),
+        index=True,
+    )
+    position: Mapped[int] = mapped_column(SmallInteger)
+    # Source, source id, group, and date: identifies the task across rebuilds.
+    task_key: Mapped[str] = mapped_column(String(120), unique=True)
+    # What is done once: a vaccination's whole age week (the same key on its 7 days), a medicine's
+    # single course day (= task_key). Snoozes apply to it (layer_health_reminder_snoozes).
+    occurrence_key: Mapped[str] = mapped_column(String(120), index=True)
+    type: Mapped[str] = mapped_column(String(12))
+    vaccination_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "layer_vaccinations.id", ondelete="RESTRICT", name="fk_layer_health_daily_reminder_tasks_vaccination_id"
+        ),
+        index=True,
+    )
+    medicine_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "layer_medicine_programs.id", ondelete="RESTRICT", name="fk_layer_health_daily_reminder_tasks_medicine_id"
+        ),
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255))
+    target_disease: Mapped[str | None] = mapped_column(String(255))
+    purpose: Mapped[str | None] = mapped_column(String(255))
+    method: Mapped[str] = mapped_column(String(20))
+    dosage: Mapped[str | None] = mapped_column(String(255))
+    notes: Mapped[str | None] = mapped_column(Text)
+    window_start: Mapped[date | None] = mapped_column(Date)
+    window_end: Mapped[date | None] = mapped_column(Date)
+    course_day: Mapped[int | None] = mapped_column(SmallInteger)
+    course_days: Mapped[int | None] = mapped_column(SmallInteger)
+    reminder: Mapped[LayerHealthDailyReminder] = relationship(back_populates="tasks")
+
+
+class LayerHealthReminderSnooze(Base):
+    """Stops reminding one occurrence (``occurrence_key`` of the reminder tasks): every task of it,
+    also the ones the nightly job writes later. Part of the reminder context: it knows nothing of
+    why it was snoozed beyond ``source`` and ``source_id`` (e.g. the activity the ABK recorded)."""
+
+    __tablename__ = "layer_health_reminder_snoozes"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    occurrence_key: Mapped[str] = mapped_column(String(120), unique=True)
+    snoozed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    snoozed_by_employee_id: Mapped[int | None] = mapped_column(
+        ForeignKey("employees.id", ondelete="RESTRICT", name="fk_layer_health_reminder_snoozes_snoozed_by_employee_id")
+    )
+    source: Mapped[str] = mapped_column(String(60))
+    source_id: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class LayerHealthDailyActivity(TimestampMixin, Base):
+    """A vaccination or medicine the ABK recorded as done, or as skipped with a reason.
+
+    Standalone: every detail of the reminder task (age, program details, vaccination week, course
+    day) is copied when it is recorded, so the activity never depends on the reminder tables, which
+    the nightly job rewrites. ``reminder_task_key`` and ``occurrence_key`` only tell which reminder it
+    answered. One activity per occurrence: a vaccination once per age week, a medicine once per course
+    day.
+    """
+
+    __tablename__ = "layer_health_daily_activities"
+    __table_args__ = (
+        CheckConstraint("status IN ('DONE','SKIPPED')", name="status"),
+        CheckConstraint(
+            "(status = 'DONE' AND skip_reason IS NULL) OR (status = 'SKIPPED' AND skip_reason IS NOT NULL)",
+            name="skip_reason",
+        ),
+        CheckConstraint("type IN ('VACCINATION','MEDICINE')", name="type"),
+        CheckConstraint("age_week >= 0 AND age_day BETWEEN 1 AND 7", name="age"),
+        CheckConstraint(
+            "(type = 'VACCINATION' AND vaccination_id IS NOT NULL AND medicine_id IS NULL"
+            " AND window_start IS NOT NULL AND window_end = window_start + 6"
+            " AND activity_date BETWEEN window_start AND window_end"
+            " AND course_day IS NULL AND course_days IS NULL)"
+            " OR (type = 'MEDICINE' AND medicine_id IS NOT NULL AND vaccination_id IS NULL"
+            " AND window_start IS NULL AND window_end IS NULL"
+            " AND course_day BETWEEN 1 AND course_days)",
+            name="shape",
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("livestock_groups.id", ondelete="RESTRICT"), index=True)
+    # The date of the reminder task it answers: the day it was (or should have been) given.
+    activity_date: Mapped[date] = mapped_column(Date, index=True)
+    age_week: Mapped[int] = mapped_column(Integer)
+    age_day: Mapped[int] = mapped_column(SmallInteger)
+    status: Mapped[str] = mapped_column(String(10), index=True)
+    skip_reason: Mapped[str | None] = mapped_column(Text)
+    # The ABK's own remark.
+    notes: Mapped[str | None] = mapped_column(Text)
+    type: Mapped[str] = mapped_column(String(12))
+    # Explicit names: the conventional ones exceed PostgreSQL's 63 characters.
+    vaccination_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "layer_vaccinations.id", ondelete="RESTRICT", name="fk_layer_health_daily_activities_vaccination_id"
+        ),
+        index=True,
+    )
+    medicine_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "layer_medicine_programs.id", ondelete="RESTRICT", name="fk_layer_health_daily_activities_medicine_id"
+        ),
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255))
+    target_disease: Mapped[str | None] = mapped_column(String(255))
+    purpose: Mapped[str | None] = mapped_column(String(255))
+    method: Mapped[str] = mapped_column(String(20))
+    dosage: Mapped[str | None] = mapped_column(String(255))
+    # The program's notes (instructions), as reminded.
+    program_notes: Mapped[str | None] = mapped_column(Text)
+    window_start: Mapped[date | None] = mapped_column(Date)
+    window_end: Mapped[date | None] = mapped_column(Date)
+    course_day: Mapped[int | None] = mapped_column(SmallInteger)
+    course_days: Mapped[int | None] = mapped_column(SmallInteger)
+    reminder_task_key: Mapped[str] = mapped_column(String(120))
+    occurrence_key: Mapped[str] = mapped_column(String(120), unique=True)
+    recorded_by_employee_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "employees.id", ondelete="RESTRICT", name="fk_layer_health_daily_activities_recorded_by_employee_id"
+        ),
+        index=True,
+    )
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    group: Mapped[LivestockGroup] = relationship()
+    recorded_by: Mapped[Employee] = relationship()
